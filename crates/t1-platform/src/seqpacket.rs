@@ -234,6 +234,14 @@ impl fmt::Debug for SystemdSeqPacketListener {
     }
 }
 
+impl AsFd for SystemdSeqPacketListener {
+    /// Borrows the listener for readiness polling only; accept through
+    /// [`Self::listener`].
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.descriptor.as_fd()
+    }
+}
+
 impl SystemdSeqPacketListener {
     /// Adopts exactly one systemd listener at the expected Unix pathname.
     ///

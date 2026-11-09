@@ -34,8 +34,20 @@ static enum t1_touchbar_io_status poll_descriptors(
 	uint64_t deadline;
 	int remaining;
 
-	if (watched == NULL || count == 0 || timeout_ms > (unsigned int)INT_MAX)
+	if (watched == NULL || count == 0 ||
+	    (timeout_ms > (unsigned int)INT_MAX &&
+	     timeout_ms != T1_TOUCHBAR_WAIT_FOREVER))
 		return T1_TOUCHBAR_IO_ERROR_ARGUMENT;
+	if (timeout_ms == T1_TOUCHBAR_WAIT_FOREVER) {
+		for (;;) {
+			int result = poll(watched, count, -1);
+
+			if (result > 0)
+				return T1_TOUCHBAR_IO_OK;
+			if (result < 0 && errno != EINTR)
+				return T1_TOUCHBAR_IO_ERROR_IO;
+		}
+	}
 	if (monotonic_ms(&start) != 0 ||
 	    UINT64_MAX - start < (uint64_t)timeout_ms)
 		return T1_TOUCHBAR_IO_ERROR_IO;
@@ -135,32 +147,41 @@ enum t1_touchbar_io_status t1_touchbar_wait_inputs(
 
 enum t1_touchbar_io_status t1_touchbar_wait_events(
 	int digitizer_descriptor, int fn_descriptor, int client_descriptor,
-	uint32_t client_interest, unsigned int timeout_ms,
-	uint32_t *ready_events)
+	uint32_t client_interest, int listener_descriptor,
+	unsigned int timeout_ms, uint32_t *ready_events)
 {
 	const uint32_t client_mask = T1_TOUCHBAR_CLIENT_READABLE |
 		T1_TOUCHBAR_CLIENT_WRITABLE;
-	struct pollfd watched[3] = {
+	struct pollfd watched[4] = {
 		{ .fd = digitizer_descriptor, .events = POLLIN },
 		{ .fd = fn_descriptor, .events = POLLIN },
-		{ .fd = client_descriptor },
 	};
+	struct pollfd *client = NULL;
+	struct pollfd *listener = NULL;
+	nfds_t count = 2;
 	enum t1_touchbar_io_status status;
-	short client_poll_events = 0;
 
 	if (digitizer_descriptor < 0 || fn_descriptor < 0 ||
-	    client_descriptor < -1 || ready_events == NULL ||
+	    client_descriptor < -1 || listener_descriptor < -1 ||
+	    ready_events == NULL ||
 	    (client_interest & ~client_mask) != 0 ||
 	    ((client_descriptor == -1) != (client_interest == 0)))
 		return T1_TOUCHBAR_IO_ERROR_ARGUMENT;
-	if ((client_interest & T1_TOUCHBAR_CLIENT_READABLE) != 0)
-		client_poll_events |= POLLIN;
-	if ((client_interest & T1_TOUCHBAR_CLIENT_WRITABLE) != 0)
-		client_poll_events |= POLLOUT;
-	watched[2].events = client_poll_events;
+	if (client_descriptor != -1) {
+		client = &watched[count++];
+		client->fd = client_descriptor;
+		if ((client_interest & T1_TOUCHBAR_CLIENT_READABLE) != 0)
+			client->events |= POLLIN;
+		if ((client_interest & T1_TOUCHBAR_CLIENT_WRITABLE) != 0)
+			client->events |= POLLOUT;
+	}
+	if (listener_descriptor != -1) {
+		listener = &watched[count++];
+		listener->fd = listener_descriptor;
+		listener->events = POLLIN;
+	}
 	*ready_events = 0;
-	status = poll_descriptors(watched, client_descriptor == -1 ? 2 : 3,
-				  timeout_ms);
+	status = poll_descriptors(watched, count, timeout_ms);
 	if (status != T1_TOUCHBAR_IO_OK)
 		return status;
 	status = validate_input(&watched[0]);
@@ -173,16 +194,18 @@ enum t1_touchbar_io_status t1_touchbar_wait_events(
 		*ready_events |= T1_TOUCHBAR_INPUT_DIGITIZER_READY;
 	if ((watched[1].revents & POLLIN) != 0)
 		*ready_events |= T1_TOUCHBAR_INPUT_FN_READY;
-	if (client_descriptor != -1) {
-		if ((watched[2].revents & POLLNVAL) != 0)
+	if (client != NULL) {
+		if ((client->revents & POLLNVAL) != 0)
 			return T1_TOUCHBAR_IO_ERROR_IO;
-		if ((watched[2].revents & POLLIN) != 0)
+		if ((client->revents & POLLIN) != 0)
 			*ready_events |= T1_TOUCHBAR_CLIENT_READABLE;
-		if ((watched[2].revents & POLLOUT) != 0)
+		if ((client->revents & POLLOUT) != 0)
 			*ready_events |= T1_TOUCHBAR_CLIENT_WRITABLE;
-		if ((watched[2].revents & (POLLERR | POLLHUP)) != 0)
+		if ((client->revents & (POLLERR | POLLHUP)) != 0)
 			*ready_events |= client_interest;
 	}
+	if (listener != NULL && listener->revents != 0)
+		*ready_events |= T1_TOUCHBAR_LISTENER_READY;
 	return *ready_events == 0 ? T1_TOUCHBAR_IO_ERROR_IO :
 		T1_TOUCHBAR_IO_OK;
 }

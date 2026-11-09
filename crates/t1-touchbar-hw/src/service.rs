@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fmt;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use t1_platform::diagnostics::{Component, Stage, observe};
@@ -32,7 +32,7 @@ use crate::wire::{
 };
 
 const SOCKET_PATH: &std::ffi::CStr = c"/run/t1bridge/touchbar.sock";
-const INPUT_WAIT_MS: u32 = 10;
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 const SESSION_REVALIDATE_INTERVAL: Duration = Duration::from_millis(50);
 const BRIGHTNESS_ACTION_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_INPUT_DRAIN: usize = 32;
@@ -305,8 +305,7 @@ pub fn run() -> Result<(), ServiceError> {
     let listen_fds = env::var("LISTEN_FDS").map_err(|_| ServiceError::Activation)?;
     let activation =
         SystemdActivation::parse(&listen_pid, &listen_fds).map_err(|_| ServiceError::Activation)?;
-    let listener = SystemdSeqPacketListener::adopt(activation, SOCKET_PATH)
-        .map_err(|_| ServiceError::Listener)?;
+    let mut listener = RendererListener::adopt(activation)?;
 
     let mut display = observe_hardware(Stage::DisplayOpen, TouchBarDisplay::open)
         .map_err(ServiceError::Display)?;
@@ -385,18 +384,19 @@ pub fn run() -> Result<(), ServiceError> {
         }
 
         if connection.is_none()
-            && listener.is_ready().map_err(|_| ServiceError::Listener)?
-            && let Ok(descriptor) = listener.listener().accept()
-            && observe(Component::TouchbarHardware, Stage::SessionAdmission, || {
-                admit(&descriptor, &mut session)
-            })
-            .is_ok()
+            && let Some(descriptor) = listener.accept(&mut session)?
         {
             connection = Some(Connection::new(descriptor, layout));
             last_session_check = Instant::now();
         }
 
-        let ready = wait_for_service_events(&digitizer, &function, connection.as_ref())?;
+        let ready = wait_for_service_events(
+            &digitizer,
+            &function,
+            connection.as_ref(),
+            &listener,
+            last_session_check,
+        )?;
         process_input(
             ready,
             &mut digitizer,
@@ -409,18 +409,44 @@ pub fn run() -> Result<(), ServiceError> {
     }
 }
 
+/// Returns how long the loop may block before timed work is due, or `None`
+/// when only descriptor readiness can create work.
+fn wait_timeout(
+    now: Instant,
+    session_revalidation_at: Option<Instant>,
+    accept_retry_at: Option<Instant>,
+) -> Option<Duration> {
+    [session_revalidation_at, accept_retry_at]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|deadline| deadline.saturating_duration_since(now))
+}
+
+/// Blocks until a descriptor is ready or timed work is due. Session
+/// revalidation is due only while a renderer is connected, and the listener
+/// is watched only while a renderer could be accepted.
 fn wait_for_service_events(
     digitizer: &TouchBarDigitizer,
     function: &TouchBarFnInput,
     connection: Option<&Connection>,
+    listener: &RendererListener,
+    last_session_check: Instant,
 ) -> Result<ReadyInputs, ServiceError> {
+    let session_revalidation_at =
+        connection.map(|_| last_session_check + SESSION_REVALIDATE_INTERVAL);
+    let (listen, accept_retry_at) = match connection {
+        Some(_) => (None, None),
+        None => (listener.poll_descriptor(), listener.retry_at),
+    };
+    let timeout = wait_timeout(Instant::now(), session_revalidation_at, accept_retry_at);
     let client = connection.map(|active| {
         (
             active.descriptor.as_fd(),
             client_interest(active.control.is_some(), active.input.is_some()),
         )
     });
-    match wait_events(digitizer, function, client, INPUT_WAIT_MS)
+    match wait_events(digitizer, function, client, listen, timeout)
         .map_err(|_| ServiceError::Input)?
     {
         EventWait::Ready(events) => Ok(events.inputs),
@@ -504,6 +530,61 @@ const fn client_interest(has_control: bool, has_input: bool) -> ClientInterest {
 
 fn observe_hardware<T, E>(stage: Stage, operation: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     observe(Component::TouchbarHardware, stage, operation)
+}
+
+/// The renderer listener and its backoff after a failed `accept`.
+struct RendererListener {
+    listener: SystemdSeqPacketListener,
+    /// A connection `accept` could not take stays queued and keeps the
+    /// listener readable, so it leaves the poll set until this deadline.
+    retry_at: Option<Instant>,
+}
+
+impl RendererListener {
+    fn adopt(activation: SystemdActivation) -> Result<Self, ServiceError> {
+        let listener = SystemdSeqPacketListener::adopt(activation, SOCKET_PATH)
+            .map_err(|_| ServiceError::Listener)?;
+        Ok(Self {
+            listener,
+            retry_at: None,
+        })
+    }
+
+    fn poll_descriptor(&self) -> Option<BorrowedFd<'_>> {
+        self.retry_at.is_none().then(|| self.listener.as_fd())
+    }
+
+    /// Accepts and admits one queued renderer, if any.
+    fn accept(
+        &mut self,
+        session: &mut TouchBarSessionWatch,
+    ) -> Result<Option<OwnedFd>, ServiceError> {
+        if self
+            .retry_at
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+        {
+            return Ok(None);
+        }
+        self.retry_at = None;
+        if !self
+            .listener
+            .is_ready()
+            .map_err(|_| ServiceError::Listener)?
+        {
+            return Ok(None);
+        }
+        let Ok(descriptor) = self.listener.listener().accept() else {
+            self.retry_at = Some(Instant::now() + ACCEPT_RETRY_DELAY);
+            return Ok(None);
+        };
+        Ok(
+            observe(Component::TouchbarHardware, Stage::SessionAdmission, || {
+                admit(&descriptor, session)
+            })
+            .is_ok()
+            .then_some(descriptor),
+        )
+    }
 }
 
 fn admit(descriptor: &OwnedFd, session: &mut TouchBarSessionWatch) -> Result<(), ()> {
@@ -1045,6 +1126,24 @@ mod tests {
             cancellation_response(Err(crate::touchid_cancel::CancelTouchIdError)),
             ServiceMessage::Error(ErrorCode::IoFailure)
         );
+    }
+
+    #[test]
+    fn idle_service_blocks_until_the_nearest_timed_work() {
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(7);
+        let later = now + SESSION_REVALIDATE_INTERVAL;
+
+        assert_eq!(wait_timeout(now, None, None), None);
+        assert_eq!(
+            wait_timeout(now, Some(later), None),
+            Some(SESSION_REVALIDATE_INTERVAL)
+        );
+        assert_eq!(
+            wait_timeout(now, Some(later), Some(soon)),
+            Some(Duration::from_millis(7))
+        );
+        assert_eq!(wait_timeout(later, Some(now), None), Some(Duration::ZERO));
     }
 
     #[test]

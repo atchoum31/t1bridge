@@ -4,6 +4,9 @@ pub mod diagnostics;
 #[allow(unsafe_code)]
 mod ffi;
 
+#[cfg(any(feature = "seqpacket", feature = "touchbar-io"))]
+mod poll_timeout;
+
 #[cfg(feature = "online-recovery")]
 #[allow(unsafe_code)]
 pub mod recovery_io;

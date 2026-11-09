@@ -7,12 +7,15 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/input.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define EXPECT_TRUE(condition)                                                   \
@@ -162,14 +165,14 @@ static void test_combined_event_poll(void)
 			       SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK,
 			       0, client) == 0);
 	EXPECT_TRUE(t1_touchbar_wait_events(
-			    digitizer[0], fn[0], -1, 0, 0, &ready) ==
+			    digitizer[0], fn[0], -1, 0, -1, 0, &ready) ==
 		    T1_TOUCHBAR_IO_IDLE);
 	EXPECT_TRUE(ready == 0);
 
 	write_complete(client[1], &byte, sizeof(byte));
 	EXPECT_TRUE(t1_touchbar_wait_events(
 			    digitizer[0], fn[0], client[0],
-			    T1_TOUCHBAR_CLIENT_READABLE, 0, &ready) ==
+			    T1_TOUCHBAR_CLIENT_READABLE, -1, 0, &ready) ==
 		    T1_TOUCHBAR_IO_OK);
 	EXPECT_TRUE(ready == T1_TOUCHBAR_CLIENT_READABLE);
 	EXPECT_TRUE(read(client[0], &byte, sizeof(byte)) == 1);
@@ -179,7 +182,7 @@ static void test_combined_event_poll(void)
 	write_complete(client[1], &byte, sizeof(byte));
 	EXPECT_TRUE(t1_touchbar_wait_events(
 			    digitizer[0], fn[0], client[0],
-			    T1_TOUCHBAR_CLIENT_READABLE, 0, &ready) ==
+			    T1_TOUCHBAR_CLIENT_READABLE, -1, 0, &ready) ==
 		    T1_TOUCHBAR_IO_OK);
 	EXPECT_TRUE(ready == (T1_TOUCHBAR_INPUT_DIGITIZER_READY |
 			      T1_TOUCHBAR_INPUT_FN_READY |
@@ -190,7 +193,7 @@ static void test_combined_event_poll(void)
 
 	EXPECT_TRUE(t1_touchbar_wait_events(
 			    digitizer[0], fn[0], client[0],
-			    T1_TOUCHBAR_CLIENT_WRITABLE, 0, &ready) ==
+			    T1_TOUCHBAR_CLIENT_WRITABLE, -1, 0, &ready) ==
 		    T1_TOUCHBAR_IO_OK);
 	EXPECT_TRUE(ready == T1_TOUCHBAR_CLIENT_WRITABLE);
 	for (;;) {
@@ -205,7 +208,7 @@ static void test_combined_event_poll(void)
 	}
 	EXPECT_TRUE(t1_touchbar_wait_events(
 			    digitizer[0], fn[0], client[0],
-			    T1_TOUCHBAR_CLIENT_WRITABLE, 0, &ready) ==
+			    T1_TOUCHBAR_CLIENT_WRITABLE, -1, 0, &ready) ==
 		    T1_TOUCHBAR_IO_IDLE);
 	EXPECT_TRUE(ready == 0);
 	for (drained = 0; drained < 1024; ++drained) {
@@ -213,7 +216,7 @@ static void test_combined_event_poll(void)
 			    (ssize_t)sizeof(payload));
 		if (t1_touchbar_wait_events(
 			    digitizer[0], fn[0], client[0],
-			    T1_TOUCHBAR_CLIENT_WRITABLE, 0, &ready) ==
+			    T1_TOUCHBAR_CLIENT_WRITABLE, -1, 0, &ready) ==
 		    T1_TOUCHBAR_IO_OK)
 			break;
 	}
@@ -225,17 +228,79 @@ static void test_combined_event_poll(void)
 	EXPECT_TRUE(close(client[1]) == 0);
 	EXPECT_TRUE(t1_touchbar_wait_events(
 			    digitizer[0], fn[0], client[0],
-			    T1_TOUCHBAR_CLIENT_READABLE, 0, &ready) ==
+			    T1_TOUCHBAR_CLIENT_READABLE, -1, 0, &ready) ==
 		    T1_TOUCHBAR_IO_OK);
 	EXPECT_TRUE(ready == T1_TOUCHBAR_CLIENT_READABLE);
 	EXPECT_TRUE(close(client[0]) == 0);
 	EXPECT_TRUE(close(fn[1]) == 0);
 	EXPECT_TRUE(t1_touchbar_wait_events(
-			    digitizer[0], fn[0], -1, 0, 0, &ready) ==
+			    digitizer[0], fn[0], -1, 0, -1, 0, &ready) ==
 		    T1_TOUCHBAR_IO_ERROR_CLOSED);
 	EXPECT_TRUE(close(digitizer[0]) == 0);
 	EXPECT_TRUE(close(digitizer[1]) == 0);
 	EXPECT_TRUE(close(fn[0]) == 0);
+}
+
+static void test_listener_and_unbounded_event_poll(void)
+{
+	int digitizer[2];
+	int fn[2];
+	int listener[2];
+	uint32_t ready = UINT32_MAX;
+	uint8_t byte = 0x5a;
+	pid_t writer;
+	int status;
+
+	EXPECT_TRUE(pipe2(digitizer, O_CLOEXEC | O_NONBLOCK) == 0);
+	EXPECT_TRUE(pipe2(fn, O_CLOEXEC | O_NONBLOCK) == 0);
+	EXPECT_TRUE(pipe2(listener, O_CLOEXEC | O_NONBLOCK) == 0);
+	EXPECT_TRUE(t1_touchbar_wait_events(
+			    digitizer[0], fn[0], -1, 0, listener[0], 0,
+			    &ready) == T1_TOUCHBAR_IO_IDLE);
+	EXPECT_TRUE(ready == 0);
+	EXPECT_TRUE(t1_touchbar_wait_events(
+			    digitizer[0], fn[0], -1, 0, -2, 0, &ready) ==
+		    T1_TOUCHBAR_IO_ERROR_ARGUMENT);
+	EXPECT_TRUE(t1_touchbar_wait_events(
+			    digitizer[0], fn[0], -1, 0, listener[0],
+			    (unsigned int)INT_MAX + 1U, &ready) ==
+		    T1_TOUCHBAR_IO_ERROR_ARGUMENT);
+
+	write_complete(listener[1], &byte, sizeof(byte));
+	EXPECT_TRUE(t1_touchbar_wait_events(
+			    digitizer[0], fn[0], -1, 0, listener[0],
+			    T1_TOUCHBAR_WAIT_FOREVER, &ready) ==
+		    T1_TOUCHBAR_IO_OK);
+	EXPECT_TRUE(ready == T1_TOUCHBAR_LISTENER_READY);
+	EXPECT_TRUE(read(listener[0], &byte, sizeof(byte)) == 1);
+
+	writer = fork();
+	EXPECT_TRUE(writer >= 0);
+	if (writer == 0) {
+		struct timespec delay = { .tv_nsec = 20000000 };
+
+		nanosleep(&delay, NULL);
+		_exit(write(digitizer[1], &byte, sizeof(byte)) == 1 ?
+			      EXIT_SUCCESS : EXIT_FAILURE);
+	}
+	EXPECT_TRUE(t1_touchbar_wait_events(
+			    digitizer[0], fn[0], -1, 0, listener[0],
+			    T1_TOUCHBAR_WAIT_FOREVER, &ready) ==
+		    T1_TOUCHBAR_IO_OK);
+	EXPECT_TRUE(ready == T1_TOUCHBAR_INPUT_DIGITIZER_READY);
+	EXPECT_TRUE(waitpid(writer, &status, 0) == writer);
+	EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS);
+
+	EXPECT_TRUE(close(listener[1]) == 0);
+	EXPECT_TRUE(t1_touchbar_wait_events(
+			    digitizer[0], fn[0], -1, 0, listener[0], 0,
+			    &ready) == T1_TOUCHBAR_IO_OK);
+	EXPECT_TRUE((ready & T1_TOUCHBAR_LISTENER_READY) != 0);
+	EXPECT_TRUE(close(listener[0]) == 0);
+	EXPECT_TRUE(close(digitizer[0]) == 0);
+	EXPECT_TRUE(close(digitizer[1]) == 0);
+	EXPECT_TRUE(close(fn[0]) == 0);
+	EXPECT_TRUE(close(fn[1]) == 0);
 }
 
 static struct input_event input_event(uint16_t type, uint16_t code, int value)
@@ -387,6 +452,7 @@ int main(void)
 	test_poll_and_digitizer_reports();
 	test_combined_input_poll();
 	test_combined_event_poll();
+	test_listener_and_unbounded_event_poll();
 	test_fn_edges();
 	test_uinput_key_allowlist();
 	test_tracked_keys_are_released_during_cleanup();

@@ -424,6 +424,7 @@ unsafe extern "C" {
         fn_descriptor: c_int,
         client_descriptor: c_int,
         client_interest: u32,
+        listener_descriptor: c_int,
         timeout_ms: u32,
         ready_events: *mut u32,
     ) -> c_int;
@@ -1774,6 +1775,7 @@ pub(super) fn wait_touchbar_events(
     function: RawFd,
     client: RawFd,
     client_interest: u32,
+    listener: RawFd,
     timeout_ms: u32,
 ) -> (c_int, u32) {
     let mut ready = 0;
@@ -1785,6 +1787,7 @@ pub(super) fn wait_touchbar_events(
             function,
             client,
             client_interest,
+            listener,
             timeout_ms,
             &raw mut ready,
         )

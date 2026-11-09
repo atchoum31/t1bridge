@@ -5,6 +5,7 @@ use std::{
     fmt,
     os::fd::{AsRawFd, BorrowedFd},
     ptr::NonNull,
+    time::Duration,
 };
 
 use crate::ffi;
@@ -15,6 +16,7 @@ const DIGITIZER_READY: u32 = 1;
 const FN_READY: u32 = 2;
 const CLIENT_READABLE: u32 = 4;
 const CLIENT_WRITABLE: u32 = 8;
+const LISTENER_READY: u32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TouchBarIoError {
@@ -236,6 +238,7 @@ pub struct ReadyEvents {
     pub inputs: ReadyInputs,
     pub client_readable: bool,
     pub client_writable: bool,
+    pub listener: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -271,7 +274,8 @@ pub fn wait_inputs(
     }
 }
 
-/// Waits for hardware input and optional renderer socket readiness together.
+/// Waits for hardware input, optional renderer socket readiness, and an
+/// optional listener together. A `None` timeout blocks until one is ready.
 ///
 /// # Errors
 ///
@@ -281,7 +285,8 @@ pub fn wait_events(
     digitizer: &TouchBarDigitizer,
     function: &TouchBarFnInput,
     client: Option<(BorrowedFd<'_>, ClientInterest)>,
-    timeout_ms: u32,
+    listener: Option<BorrowedFd<'_>>,
+    timeout: Option<Duration>,
 ) -> Result<EventWait, TouchBarIoError> {
     let (client_descriptor, client_interest) = match client {
         Some((descriptor, interest)) => {
@@ -301,12 +306,18 @@ pub fn wait_events(
         function.descriptor.as_raw_fd(),
         client_descriptor,
         client_interest,
-        timeout_ms,
+        listener.map_or(-1, |descriptor| descriptor.as_raw_fd()),
+        crate::poll_timeout::milliseconds(timeout),
     );
     match NativeStatus::from_status(status)? {
         NativeStatus::Complete
             if ready != 0
-                && ready & !(DIGITIZER_READY | FN_READY | CLIENT_READABLE | CLIENT_WRITABLE)
+                && ready
+                    & !(DIGITIZER_READY
+                        | FN_READY
+                        | CLIENT_READABLE
+                        | CLIENT_WRITABLE
+                        | LISTENER_READY)
                     == 0 =>
         {
             Ok(EventWait::Ready(ReadyEvents {
@@ -316,6 +327,7 @@ pub fn wait_events(
                 },
                 client_readable: ready & CLIENT_READABLE != 0,
                 client_writable: ready & CLIENT_WRITABLE != 0,
+                listener: ready & LISTENER_READY != 0,
             }))
         }
         NativeStatus::Complete | NativeStatus::Resync => Err(TouchBarIoError::Unknown),
@@ -469,6 +481,47 @@ mod tests {
         };
         drop(wrapped);
         assert_eq!(function_peer.read(&mut byte).expect("function EOF"), 0);
+    }
+
+    #[test]
+    fn unbounded_event_wait_wakes_for_a_queued_listener_connection() {
+        use std::io::Write;
+        use std::os::fd::AsFd;
+
+        let (digitizer, _digitizer_peer) = UnixStream::pair().expect("digitizer pair");
+        let digitizer = TouchBarDigitizer {
+            descriptor: OwnedFd::from(digitizer),
+        };
+        let (function, _function_peer) = UnixStream::pair().expect("function pair");
+        let function = TouchBarFnInput {
+            descriptor: OwnedFd::from(function),
+        };
+        let (listener, mut connector) = UnixStream::pair().expect("listener pair");
+
+        assert_eq!(
+            wait_events(
+                &digitizer,
+                &function,
+                None,
+                Some(listener.as_fd()),
+                Some(Duration::ZERO)
+            ),
+            Ok(EventWait::Idle)
+        );
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            connector.write_all(b"c").expect("signal listener");
+            connector
+        });
+        let ready = wait_events(&digitizer, &function, None, Some(listener.as_fd()), None);
+        let _connector = writer.join().expect("writer thread");
+        assert_eq!(
+            ready,
+            Ok(EventWait::Ready(ReadyEvents {
+                listener: true,
+                ..ReadyEvents::default()
+            }))
+        );
     }
 
     #[test]
