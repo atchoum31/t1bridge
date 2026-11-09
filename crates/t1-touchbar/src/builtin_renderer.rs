@@ -335,6 +335,14 @@ fn dispatch_desktop(provider: Option<&DesktopProvider>, action: DesktopAction) {
     }
 }
 
+/// Whether the shown volume follows provider refreshes during a touch, or
+/// belongs to the touch after its first volume step until release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TouchVolume {
+    FollowsDesktop,
+    OwnedByTouch,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingRequest {
     Register,
@@ -358,6 +366,7 @@ struct RendererSession {
     hardware_capabilities: StockCapabilities,
     desktop_state: DesktopState,
     pending_desktop_state: Option<DesktopState>,
+    touch_volume: TouchVolume,
     display_off: bool,
     levels: StockLevels,
     touch_id: TouchIdOverlay,
@@ -409,6 +418,7 @@ impl RendererSession {
             hardware_capabilities: capabilities,
             desktop_state: DesktopState::default(),
             pending_desktop_state: None,
+            touch_volume: TouchVolume::FollowsDesktop,
             display_off: false,
             levels: StockLevels::default(),
             touch_id,
@@ -499,6 +509,9 @@ impl RendererSession {
                 self.dirty |= outcome.redraw;
                 for action in outcome.actions {
                     self.dispatch(action, connection, provider)?;
+                }
+                if self.input.is_idle() {
+                    self.touch_volume = TouchVolume::FollowsDesktop;
                 }
                 if outcome.cancel_touch_id {
                     self.send_cancel_touch_id(connection)?;
@@ -697,6 +710,7 @@ impl RendererSession {
                     StepDirection::Up => current.saturating_add(VOLUME_STEP_PERCENT).min(100),
                 };
                 self.levels.volume = Some(value);
+                self.touch_volume = TouchVolume::OwnedByTouch;
                 self.dirty = true;
                 dispatch_desktop(provider, DesktopAction::SetVolume(value));
                 Ok(())
@@ -944,7 +958,19 @@ impl RendererSession {
             return Ok(());
         }
         if !self.input.is_idle() {
-            self.pending_desktop_state = Some(state);
+            // A touch may still step volume from the shown level, so take a
+            // fresh level when the layout stays the same.
+            if self.pending_desktop_state.is_none()
+                && self.desktop_state.capabilities == state.capabilities
+                && self.touch_volume == TouchVolume::FollowsDesktop
+            {
+                self.levels.volume = state.volume;
+                self.levels.muted = state.muted;
+                self.desktop_state = state;
+                self.dirty = true;
+            } else {
+                self.pending_desktop_state = Some(state);
+            }
             return Ok(());
         }
         self.apply_desktop_state(state)
@@ -1513,6 +1539,44 @@ mod tests {
         assert_eq!(session.levels.volume, Some(42));
         assert!(!session.levels.muted);
         assert!(session.dirty);
+    }
+
+    #[test]
+    fn a_touch_takes_fresh_volume_until_its_first_volume_step() {
+        let mut session = session();
+        let audio = |volume| DesktopState {
+            capabilities: DesktopCapabilities::AUDIO,
+            volume: Some(volume),
+            muted: false,
+            display_off: false,
+        };
+        session.set_desktop_state(audio(30)).expect("idle state");
+        session
+            .input
+            .ingest(&input(1, false, vec![contact(1, 60, 10)]), None)
+            .expect("start active touch");
+
+        session
+            .set_desktop_state(audio(80))
+            .expect("refresh during touch");
+        assert_eq!(session.levels.volume, Some(80));
+        assert_eq!(session.pending_desktop_state, None);
+
+        session
+            .dispatch(
+                StockAction::StepVolume(StepDirection::Up),
+                &inert_connection(),
+                None,
+            )
+            .expect("step volume");
+        let stepped = Some(80 + VOLUME_STEP_PERCENT);
+        assert_eq!(session.levels.volume, stepped);
+
+        session
+            .set_desktop_state(audio(70))
+            .expect("refresh after step");
+        assert_eq!(session.levels.volume, stepped);
+        assert_eq!(session.pending_desktop_state, Some(audio(70)));
     }
 
     #[test]

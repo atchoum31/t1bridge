@@ -412,10 +412,14 @@ the controls.
 
 Provider stdout is limited to 128 bytes and each process receives a 500 ms
 monotonic deadline. A status record is refreshed at most once per second.
-The built-in renderer refreshes every second while status changes, doubles
-the interval up to eight seconds while it stays the same, and uses eight
-seconds at once while `DISPLAY` is `0`. An action, a new touch, or any touch
-on a dark panel returns it to one second.
+The built-in renderer refreshes every second while status changes and
+doubles the interval up to eight seconds while it stays the same. While
+`DISPLAY` is `0` it refreshes every two seconds, so the panel follows the
+desktop back within that time. An action, a new touch, or any touch or Fn
+change on a dark panel schedules the next refresh within one second, after
+which the backoff starts again. A touch that has not yet stepped volume
+takes refreshed volume and mute levels at once, so a step starts from the
+desktop's current level.
 Actions return exit status zero for accepted delivery; their output is ignored.
 Malformed, oversized, timed-out, signaled, nonzero, missing, or disappearing
 providers become unavailable without stopping or restarting the renderer.

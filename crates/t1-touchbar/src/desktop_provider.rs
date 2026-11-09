@@ -26,6 +26,7 @@ const STATUS_OUTPUT_LIMIT: usize = 128;
 const CALL_DEADLINE: Duration = Duration::from_millis(500);
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const IDLE_STATUS_INTERVAL: Duration = Duration::from_secs(8);
+const DARK_STATUS_INTERVAL: Duration = Duration::from_secs(2);
 const WAIT_INTERVAL: Duration = Duration::from_millis(5);
 const ACTION_QUEUE_CAPACITY: usize = 16;
 
@@ -279,15 +280,15 @@ fn provider_worker(path: &Path, actions: &ActionMailbox, states: &Publisher<Desk
     }
 }
 
-/// Backs off while status stays the same, and starts at the longest interval
-/// while the panel is dark, since only the desktop can change it then.
+/// Backs off while status stays the same. While the panel is dark, a fixed
+/// short interval bounds how long it stays dark after the desktop wakes.
 fn next_status_interval(
     current: Duration,
     previous: Option<DesktopState>,
     state: DesktopState,
 ) -> Duration {
     if state.display_off {
-        IDLE_STATUS_INTERVAL
+        DARK_STATUS_INTERVAL
     } else if previous == Some(state) {
         current.saturating_mul(2).min(IDLE_STATUS_INTERVAL)
     } else {
@@ -732,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_status_backs_off_until_a_change_or_a_dark_panel() {
+    fn unchanged_status_backs_off_except_while_the_panel_is_dark() {
         let lit = DesktopState {
             capabilities: DesktopCapabilities::AUDIO,
             volume: Some(40),
@@ -762,8 +763,8 @@ mod tests {
             ..lit
         };
         assert_eq!(
-            next_status_interval(STATUS_INTERVAL, Some(lit), dark),
-            IDLE_STATUS_INTERVAL
+            next_status_interval(IDLE_STATUS_INTERVAL, Some(dark), dark),
+            DARK_STATUS_INTERVAL
         );
     }
 
