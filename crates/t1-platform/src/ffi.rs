@@ -331,6 +331,8 @@ unsafe extern "C" {
     #[cfg(feature = "seqpacket")]
     fn t1_seqpacket_accept(listener_descriptor: c_int, client_descriptor: *mut c_int) -> c_int;
     #[cfg(feature = "seqpacket")]
+    fn t1_seqpacket_open_pidfd(process_id: c_int, descriptor: *mut c_int) -> c_int;
+    #[cfg(feature = "seqpacket")]
     fn t1_seqpacket_connect_touchbar(client_descriptor: *mut c_int) -> c_int;
     #[cfg(feature = "seqpacket")]
     fn t1_seqpacket_connect_auth(client_descriptor: *mut c_int) -> c_int;
@@ -1395,6 +1397,21 @@ pub(super) fn accept(listener: RawFd) -> (c_int, Option<OwnedFd>) {
     let owned = if status == 0 {
         // SAFETY: the C contract returns a new owned descriptor only on success.
         Some(unsafe { OwnedFd::from_raw_fd(client) })
+    } else {
+        None
+    };
+    (status, owned)
+}
+
+#[cfg(feature = "seqpacket")]
+pub(super) fn open_pidfd(process_id: c_int) -> (c_int, Option<OwnedFd>) {
+    let mut descriptor = -1;
+    // SAFETY: `descriptor` is writable for one C `int`. Success transfers one
+    // newly opened close-on-exec pidfd; failure leaves the sentinel.
+    let status = unsafe { t1_seqpacket_open_pidfd(process_id, &raw mut descriptor) };
+    let owned = if status == 0 {
+        // SAFETY: the C contract returns a new owned descriptor only on success.
+        Some(unsafe { OwnedFd::from_raw_fd(descriptor) })
     } else {
         None
     };

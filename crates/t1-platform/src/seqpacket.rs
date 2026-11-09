@@ -328,6 +328,21 @@ pub fn wait_readable(
     }
 }
 
+/// Opens a pidfd for an unreaped child so [`wait_readable`] can wake when it
+/// exits.
+///
+/// # Errors
+///
+/// Returns [`SeqPacketError::InvalidArgument`] for a process ID that does not
+/// fit a positive `pid_t`, or [`SeqPacketError::DescriptorInspection`] when
+/// the kernel refuses the pidfd.
+pub fn open_pidfd(process_id: u32) -> Result<OwnedFd, SeqPacketError> {
+    let process_id = i32::try_from(process_id).map_err(|_| SeqPacketError::InvalidArgument)?;
+    let (status, descriptor) = ffi::open_pidfd(process_id);
+    check(status)?;
+    descriptor.ok_or(SeqPacketError::DescriptorInspection)
+}
+
 /// Borrowed local seqpacket listener descriptor.
 #[derive(Clone, Copy, Debug)]
 pub struct SeqPacketListener<'fd> {

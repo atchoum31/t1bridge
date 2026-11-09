@@ -88,6 +88,14 @@ enum t1_seqpacket_status t1_seqpacket_wait_readable(const int *descriptors,
 	size_t descriptor_count, unsigned int timeout_ms, uint32_t *ready_mask);
 
 /*
+ * Open a close-on-exec pidfd for an unreaped child. The pidfd becomes readable
+ * when the child exits, so it can join t1_seqpacket_wait_readable instead of a
+ * sleep-and-reap loop. The caller owns the returned descriptor.
+ */
+enum t1_seqpacket_status t1_seqpacket_open_pidfd(pid_t process_id,
+	int *descriptor);
+
+/*
  * Accept from a caller-owned AF_UNIX SOCK_SEQPACKET listener. The returned
  * descriptor is close-on-exec and nonblocking. This function never creates,
  * binds, listens on, or assigns a path to a socket.

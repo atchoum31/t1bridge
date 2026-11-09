@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use t1_platform::seqpacket;
 
 use crate::latest::{self, Latest, Publisher};
 
@@ -375,49 +377,70 @@ fn run_provider(
         None
     };
     let mut child = command.spawn().map_err(|_| DesktopProviderError::Spawn)?;
+    drop(command);
     let deadline = Instant::now() + CALL_DEADLINE;
+    let exited = seqpacket::open_pidfd(child.id()).ok();
     let mut output = Vec::new();
     loop {
-        if let Some(reader) = reader.as_mut()
-            && let Err(error) = read_available(reader, &mut output)
-        {
-            terminate(&mut child);
-            return Err(error);
-        }
-        match child.try_wait().map_err(|_| DesktopProviderError::Failed)? {
-            Some(status) => {
-                if let Some(reader) = reader.as_mut()
-                    && let Err(error) = read_available(reader, &mut output)
-                {
+        if let Some(stream) = reader.as_mut() {
+            match read_available(stream, &mut output) {
+                Ok(true) => reader = None,
+                Ok(false) => {}
+                Err(error) => {
                     terminate(&mut child);
                     return Err(error);
                 }
-                return finish_status(status, output);
             }
-            None if Instant::now() >= deadline => {
-                terminate(&mut child);
-                return Err(DesktopProviderError::Timeout);
-            }
-            None => thread::sleep(WAIT_INTERVAL),
         }
+        if let Some(status) = child.try_wait().map_err(|_| DesktopProviderError::Failed)? {
+            if let Some(stream) = reader.as_mut()
+                && let Err(error) = read_available(stream, &mut output)
+            {
+                terminate(&mut child);
+                return Err(error);
+            }
+            return finish_status(status, output);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            terminate(&mut child);
+            return Err(DesktopProviderError::Timeout);
+        }
+        wait_for_child(exited.as_ref(), reader.as_ref(), remaining);
     }
 }
 
+/// Sleeps until the child exits, writes output, or the deadline passes. Without
+/// a pidfd, falls back to a short fixed sleep.
+fn wait_for_child(exited: Option<&OwnedFd>, output: Option<&UnixStream>, remaining: Duration) {
+    let waited = exited.is_some_and(|exited| {
+        seqpacket::wait_readable(
+            &[Some(exited.as_fd()), output.map(AsFd::as_fd)],
+            Some(remaining),
+        )
+        .is_ok()
+    });
+    if !waited {
+        thread::sleep(WAIT_INTERVAL.min(remaining));
+    }
+}
+
+/// Drains readable output. Returns `true` once the writer side has closed.
 fn read_available(
     reader: &mut UnixStream,
     output: &mut Vec<u8>,
-) -> Result<(), DesktopProviderError> {
+) -> Result<bool, DesktopProviderError> {
     let mut buffer = [0_u8; 64];
     loop {
         match reader.read(&mut buffer) {
-            Ok(0) => return Ok(()),
+            Ok(0) => return Ok(true),
             Ok(length) => {
                 if output.len().saturating_add(length) > STATUS_OUTPUT_LIMIT {
                     return Err(DesktopProviderError::Output);
                 }
                 output.extend_from_slice(&buffer[..length]);
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return Err(DesktopProviderError::Output),
         }

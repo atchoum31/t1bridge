@@ -1058,6 +1058,47 @@ static void test_wait_readable_blocks_until_any_descriptor_is_ready(void)
 	close_descriptor(wake[1]);
 }
 
+static void test_pidfd_wakes_wait_when_the_child_exits(void)
+{
+	int descriptor = 0;
+	int watched[1];
+	uint32_t ready = UINT32_MAX;
+	pid_t child;
+	int status = 0;
+
+	child = fork();
+	EXPECT_TRUE(child >= 0);
+	if (child == 0) {
+		struct timespec delay = { .tv_nsec = 20000000 };
+
+		nanosleep(&delay, NULL);
+		_exit(EXIT_SUCCESS);
+	}
+	EXPECT_STATUS(T1_SEQPACKET_OK,
+		      t1_seqpacket_open_pidfd(child, &descriptor));
+	EXPECT_TRUE(descriptor >= 0);
+	EXPECT_TRUE((fcntl(descriptor, F_GETFD) & FD_CLOEXEC) != 0);
+	watched[0] = descriptor;
+	EXPECT_STATUS(T1_SEQPACKET_OK,
+		      t1_seqpacket_wait_readable(watched, 1, 0, &ready));
+	EXPECT_TRUE(ready == 0);
+	EXPECT_STATUS(T1_SEQPACKET_OK,
+		      t1_seqpacket_wait_readable(watched, 1,
+						 T1_SEQPACKET_WAIT_FOREVER,
+						 &ready));
+	EXPECT_TRUE(ready == UINT32_C(1));
+	EXPECT_TRUE(waitpid(child, &status, 0) == child);
+	EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS);
+	close_descriptor(descriptor);
+
+	descriptor = 0;
+	EXPECT_STATUS(T1_SEQPACKET_INVALID_ARGUMENT,
+		      t1_seqpacket_open_pidfd(0, &descriptor));
+	EXPECT_TRUE(descriptor == -1);
+	EXPECT_STATUS(T1_SEQPACKET_INVALID_ARGUMENT,
+		      t1_seqpacket_open_pidfd(getpid(), NULL));
+}
+
 static void test_disconnect_probe_is_non_consuming_and_fail_closed(void)
 {
 	static const uint8_t packet[] = { 0x54, 0x31, 0x41, 0x55 };
@@ -1669,6 +1710,7 @@ int main(void)
 	test_peer_group_admission_uses_kernel_primary_and_supplementary();
 	test_peer_group_admission_bounds_and_validates_kernel_results();
 	test_wait_readable_blocks_until_any_descriptor_is_ready();
+	test_pidfd_wakes_wait_when_the_child_exits();
 	test_disconnect_probe_is_non_consuming_and_fail_closed();
 	test_packet_boundaries_and_truncation();
 	test_ancillary_rights_are_rejected_without_fd_leak();

@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -330,6 +331,23 @@ enum t1_seqpacket_status t1_seqpacket_wait_readable(const int *descriptors,
 		if (watched[index].revents != 0)
 			*ready_mask |= UINT32_C(1) << index;
 	}
+	return T1_SEQPACKET_OK;
+}
+
+enum t1_seqpacket_status t1_seqpacket_open_pidfd(pid_t process_id,
+	int *descriptor)
+{
+	long opened;
+
+	if (descriptor == NULL)
+		return T1_SEQPACKET_INVALID_ARGUMENT;
+	*descriptor = -1;
+	if (process_id <= 0)
+		return T1_SEQPACKET_INVALID_ARGUMENT;
+	opened = syscall(SYS_pidfd_open, process_id, 0);
+	if (opened < 0)
+		return T1_SEQPACKET_DESCRIPTOR_FAILED;
+	*descriptor = (int)opened;
 	return T1_SEQPACKET_OK;
 }
 
