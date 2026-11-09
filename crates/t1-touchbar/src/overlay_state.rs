@@ -1,15 +1,16 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use crate::latest::{self, Latest};
 
 pub const OVERLAY_STATE_PATH: &str = "/run/t1bridge/touch-id-state.json";
 
@@ -349,19 +350,23 @@ impl ProcessLiveness for ProcLiveness {
 /// Background reader for cosmetic state. Filesystem I/O never runs on the
 /// hardware-input loop.
 pub struct OverlayWatcher {
-    updates: Receiver<OverlayObservation>,
+    updates: Latest<OverlayObservation>,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl OverlayWatcher {
-    #[must_use]
-    pub fn start() -> Self {
+    /// Starts watching the fixed overlay state file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the socket error when the update wakeup cannot be created.
+    pub fn start() -> io::Result<Self> {
         Self::start_with_reader(OverlayFileReader::new(), WATCH_INTERVAL)
     }
 
-    fn start_with_reader(reader: OverlayFileReader, interval: Duration) -> Self {
-        let (sender, updates) = mpsc::channel();
+    fn start_with_reader(reader: OverlayFileReader, interval: Duration) -> io::Result<Self> {
+        let (sender, updates) = latest::channel()?;
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker = thread::spawn(move || {
@@ -372,7 +377,7 @@ impl OverlayWatcher {
                     if let OverlayObservation::NoOverlay(diagnostic) = observation {
                         eprintln!("t1-touchbar: {diagnostic}");
                     }
-                    if sender.send(observation).is_err() {
+                    if sender.publish(observation).is_err() {
                         break;
                     }
                     previous = Some(observation);
@@ -380,21 +385,23 @@ impl OverlayWatcher {
                 thread::sleep(interval);
             }
         });
-        Self {
+        Ok(Self {
             updates,
             stop,
             worker: Some(worker),
-        }
+        })
     }
 
     /// Drains queued transitions and returns only the newest observation.
     #[must_use]
     pub fn take_latest(&self) -> Option<OverlayObservation> {
-        let mut latest = None;
-        while let Ok(update) = self.updates.try_recv() {
-            latest = Some(update);
-        }
-        latest
+        self.updates.take_latest()
+    }
+
+    /// Descriptor that becomes readable when a newer observation is queued.
+    #[must_use]
+    pub fn wake_descriptor(&self) -> Option<BorrowedFd<'_>> {
+        self.updates.wake_descriptor()
     }
 }
 
@@ -1007,7 +1014,8 @@ mod tests {
     fn watcher_reports_only_observation_transitions() {
         let path = temporary_path("state.json");
         let reader = OverlayFileReader::at_path(path.clone());
-        let watcher = OverlayWatcher::start_with_reader(reader, Duration::from_millis(5));
+        let watcher = OverlayWatcher::start_with_reader(reader, Duration::from_millis(5))
+            .expect("start watcher");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         let first = loop {

@@ -33,6 +33,8 @@ const MAX_PENDING_REQUESTS: usize = 64;
 const SEND_ATTEMPTS: usize = 64;
 const SEND_RETRY_DELAY: Duration = Duration::from_millis(2);
 const RECEIVE_RETRY_DELAY: Duration = Duration::from_millis(5);
+/// Fades and enrollment progress keep the cadence the polling loop gave them.
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(5);
 const INITIAL_RECONNECT_DELAY: Duration = Duration::from_millis(50);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const VOLUME_STEP_PERCENT: u8 = 6;
@@ -51,6 +53,7 @@ pub enum BuiltinRendererError {
     Frame,
     Gesture,
     ServiceRejected,
+    Wakeup,
 }
 
 impl fmt::Display for BuiltinRendererError {
@@ -63,6 +66,7 @@ impl fmt::Display for BuiltinRendererError {
             Self::Frame => "Touch Bar frame setup failed",
             Self::Gesture => "Touch Bar input sequence failed",
             Self::ServiceRejected => "Touch Bar hardware request was rejected",
+            Self::Wakeup => "Touch Bar renderer wakeup failed",
         })
     }
 }
@@ -105,7 +109,7 @@ fn run_once(provider: Option<&DesktopProvider>) -> Result<(), BuiltinRendererErr
         stock_capabilities(features, ack.minor),
     )?;
     session.register(&connection)?;
-    let overlay_watcher = OverlayWatcher::start();
+    let overlay_watcher = OverlayWatcher::start().map_err(|_| BuiltinRendererError::Wakeup)?;
     let clock = Instant::now();
 
     loop {
@@ -125,7 +129,18 @@ fn run_once(provider: Option<&DesktopProvider>) -> Result<(), BuiltinRendererErr
         if let Some(envelope) = connection.try_receive_service(Some(dimensions))? {
             session.handle_with_provider(envelope, &connection, provider)?;
         } else {
-            thread::sleep(RECEIVE_RETRY_DELAY);
+            let timeout = session
+                .next_deadline()
+                .map(|deadline| deadline.saturating_sub(clock.elapsed()));
+            seqpacket::wait_readable(
+                &[
+                    Some(connection.descriptor.as_fd()),
+                    overlay_watcher.wake_descriptor(),
+                    provider.and_then(DesktopProvider::wake_descriptor),
+                ],
+                timeout,
+            )
+            .map_err(|_| BuiltinRendererError::Wakeup)?;
         }
     }
 }
@@ -841,6 +856,18 @@ impl RendererSession {
         self.submit_if_ready(connection)
     }
 
+    /// Session time of the next timed work for [`Self::advance`], or `None`
+    /// when only hardware input or a producer update can change the bar.
+    fn next_deadline(&self) -> Option<Duration> {
+        let animating = self.overlay_opacity != self.overlay_target_opacity
+            || self.enrollment_progress_visual != self.enrollment_progress_target;
+        let animation_frame = animating.then(|| self.now.saturating_add(ANIMATION_FRAME_INTERVAL));
+        let repeat = (!self.display_off && !self.input.wait_for_touch_release)
+            .then(|| self.input.next_repeat_at())
+            .flatten();
+        animation_frame.into_iter().chain(repeat).min()
+    }
+
     fn advance_overlay_fade(&mut self, now: Duration) {
         if self.overlay_opacity == self.overlay_target_opacity {
             return;
@@ -1168,11 +1195,17 @@ impl InputInterpreter {
         })
     }
 
+    fn next_repeat_at(&self) -> Option<Duration> {
+        self.repeat
+            .filter(|repeat| self.pressed == Some(repeat.action))
+            .map(|repeat| repeat.next_at)
+    }
+
     fn take_repeat(&mut self, now: Duration) -> Option<StockAction> {
-        let repeat = self.repeat.as_mut()?;
-        if now < repeat.next_at || self.pressed != Some(repeat.action) {
+        if self.next_repeat_at().is_none_or(|next_at| now < next_at) {
             return None;
         }
+        let repeat = self.repeat.as_mut()?;
         repeat.fired = true;
         repeat.next_at = now.saturating_add(HOLD_REPEAT_INTERVAL);
         Some(repeat.action)
@@ -2039,6 +2072,98 @@ mod tests {
             .unwrap();
         assert!(!outcome.cancel_touch_id);
         assert_eq!(outcome.actions, [StockAction::Escape]);
+    }
+
+    fn input_envelope(frame: WireInputFrame) -> Envelope<ServiceMessage> {
+        Envelope {
+            request_id: 0,
+            message: ServiceMessage::InputFrame(frame),
+        }
+    }
+
+    #[test]
+    fn idle_bar_has_no_timed_work_and_hold_repeat_wakes_on_schedule() {
+        let (renderer, hardware) =
+            t1_platform::seqpacket::pair_for_test().expect("local hardware protocol socket pair");
+        let connection = HardwareConnection::new(renderer);
+        let hardware = SeqPacketClient::new(hardware.as_fd());
+        let mut packet = vec![0; MAX_PACKET_LENGTH];
+        let mut session = RendererSession::new(
+            dimensions(),
+            RequestIds { next: 2 },
+            StockCapabilities::DISPLAY_BRIGHTNESS,
+        )
+        .expect("renderer session");
+        let idle_until = Duration::from_secs(1);
+
+        session
+            .advance(idle_until, &connection, None)
+            .expect("advance idle bar");
+        assert_eq!(session.next_deadline(), None);
+
+        session
+            .handle(
+                input_envelope(input(1, false, vec![contact(1, 13, 8)])),
+                &connection,
+            )
+            .expect("press brightness control");
+        let first_repeat = idle_until + HOLD_REPEAT_DELAY;
+        assert_eq!(session.next_deadline(), Some(first_repeat));
+
+        session
+            .advance(first_repeat, &connection, None)
+            .expect("fire first repeat");
+        let request = hardware.receive(&mut packet).expect("receive repeat step");
+        let request = wire::decode_client(
+            &packet[..request],
+            AncillaryMetadata::default(),
+            Some(dimensions()),
+        )
+        .expect("decode repeat step");
+        assert!(matches!(
+            request.message,
+            ClientMessage::StepDisplayBrightness(WireStepDirection::Down)
+        ));
+        assert_eq!(
+            session.next_deadline(),
+            Some(first_repeat + HOLD_REPEAT_INTERVAL)
+        );
+
+        session
+            .handle(input_envelope(input(2, false, Vec::new())), &connection)
+            .expect("release brightness control");
+        assert_eq!(session.next_deadline(), None);
+    }
+
+    #[test]
+    fn overlay_animations_tick_each_frame_only_until_they_settle() {
+        let connection = inert_connection();
+        let mut session = session();
+        let shown_at = Duration::from_secs(1);
+        session
+            .advance(shown_at, &connection, None)
+            .expect("advance idle bar");
+
+        session.set_overlay(Some(OverlayState::Authenticate), None);
+        assert_eq!(
+            session.next_deadline(),
+            Some(shown_at + ANIMATION_FRAME_INTERVAL)
+        );
+        let faded_in = shown_at + OVERLAY_FADE_DURATION;
+        session
+            .advance(faded_in, &connection, None)
+            .expect("finish fade");
+        assert_eq!(session.next_deadline(), None);
+
+        session.set_overlay(Some(OverlayState::Enrollment), Some(5));
+        assert_eq!(
+            session.next_deadline(),
+            Some(faded_in + ANIMATION_FRAME_INTERVAL)
+        );
+        session
+            .advance(faded_in + ENROLLMENT_PROGRESS_DURATION, &connection, None)
+            .expect("finish enrollment progress");
+        assert_eq!(session.next_deadline(), None);
     }
 
     #[test]

@@ -1,7 +1,9 @@
 #ifndef T1BRIDGE_T1_SEQPACKET_H
 #define T1BRIDGE_T1_SEQPACKET_H
 
+#include <limits.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 enum t1_seqpacket_status {
@@ -71,6 +73,19 @@ enum t1_seqpacket_status t1_seqpacket_adopt_systemd_listener_pair(
  */
 enum t1_seqpacket_status t1_seqpacket_listener_ready(
 	int listener_descriptor, int *ready);
+
+#define T1_SEQPACKET_WAIT_FOREVER UINT_MAX
+#define T1_SEQPACKET_WAIT_MAX_DESCRIPTORS 4
+
+/*
+ * Wait until any of up to T1_SEQPACKET_WAIT_MAX_DESCRIPTORS descriptors is
+ * readable, hung up, or failed, without consuming data. Entries of -1 are
+ * ignored, but at least one descriptor must be present. Timeout zero probes
+ * and T1_SEQPACKET_WAIT_FOREVER blocks. Bit i of ready_mask reports
+ * descriptors[i]; a timeout succeeds with an empty mask.
+ */
+enum t1_seqpacket_status t1_seqpacket_wait_readable(const int *descriptors,
+	size_t descriptor_count, unsigned int timeout_ms, uint32_t *ready_mask);
 
 /*
  * Accept from a caller-owned AF_UNIX SOCK_SEQPACKET listener. The returned

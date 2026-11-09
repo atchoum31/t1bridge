@@ -292,6 +292,47 @@ enum t1_seqpacket_status t1_seqpacket_listener_ready(
 	return T1_SEQPACKET_OK;
 }
 
+enum t1_seqpacket_status t1_seqpacket_wait_readable(const int *descriptors,
+	size_t descriptor_count, unsigned int timeout_ms, uint32_t *ready_mask)
+{
+	struct pollfd watched[T1_SEQPACKET_WAIT_MAX_DESCRIPTORS];
+	int present = 0;
+	int timeout;
+	int result;
+	size_t index;
+
+	if (ready_mask == NULL)
+		return T1_SEQPACKET_INVALID_ARGUMENT;
+	*ready_mask = 0;
+	if (descriptors == NULL || descriptor_count == 0 ||
+	    descriptor_count > T1_SEQPACKET_WAIT_MAX_DESCRIPTORS ||
+	    (timeout_ms > (unsigned int)INT_MAX &&
+	     timeout_ms != T1_SEQPACKET_WAIT_FOREVER))
+		return T1_SEQPACKET_INVALID_ARGUMENT;
+	memset(watched, 0, sizeof(watched));
+	for (index = 0; index < descriptor_count; ++index) {
+		if (descriptors[index] < -1)
+			return T1_SEQPACKET_INVALID_ARGUMENT;
+		present |= descriptors[index] >= 0;
+		watched[index].fd = descriptors[index];
+		watched[index].events = POLLIN;
+	}
+	if (!present)
+		return T1_SEQPACKET_INVALID_ARGUMENT;
+	timeout = timeout_ms == T1_SEQPACKET_WAIT_FOREVER ? -1 :
+		(int)timeout_ms;
+	result = poll(watched, (nfds_t)descriptor_count, timeout);
+	if (result < 0)
+		return transient_status(errno, T1_SEQPACKET_READINESS_FAILED);
+	for (index = 0; index < descriptor_count; ++index) {
+		if ((watched[index].revents & POLLNVAL) != 0)
+			return T1_SEQPACKET_DESCRIPTOR_FAILED;
+		if (watched[index].revents != 0)
+			*ready_mask |= UINT32_C(1) << index;
+	}
+	return T1_SEQPACKET_OK;
+}
+
 enum t1_seqpacket_status t1_seqpacket_accept(int listener_descriptor,
 	int *client_descriptor)
 {

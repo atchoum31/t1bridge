@@ -5,17 +5,16 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
-use std::os::fd::OwnedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{
-    Arc, Condvar, Mutex,
-    mpsc::{self, Receiver, TryRecvError},
-};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::latest::{self, Latest, Publisher};
 
 pub const PROVIDER_ENVIRONMENT: &str = "T1BRIDGE_DESKTOP_PROVIDER";
 
@@ -140,7 +139,7 @@ pub fn notify_renderer_fallback(path: &Path, reason: RendererFallback) -> bool {
 /// Nonblocking handle to one bounded provider worker.
 pub struct DesktopProvider {
     actions: Arc<ActionMailbox>,
-    states: Receiver<DesktopState>,
+    states: Latest<DesktopState>,
 }
 
 #[derive(Debug, Default)]
@@ -160,7 +159,7 @@ impl DesktopProvider {
     #[must_use]
     pub fn start(path: &Path) -> Option<Self> {
         let path = resolve_provider_path(Some(path.as_os_str()))?;
-        let (state_sender, state_receiver) = mpsc::channel();
+        let (state_sender, state_receiver) = latest::channel().ok()?;
         let actions = Arc::new(ActionMailbox::default());
         let worker_actions = Arc::clone(&actions);
         thread::Builder::new()
@@ -176,13 +175,13 @@ impl DesktopProvider {
     /// Returns the newest available status and discards superseded snapshots.
     #[must_use]
     pub fn take_latest(&self) -> Option<DesktopState> {
-        let mut latest = None;
-        loop {
-            match self.states.try_recv() {
-                Ok(state) => latest = Some(state),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return latest,
-            }
-        }
+        self.states.take_latest()
+    }
+
+    /// Descriptor that becomes readable when a newer status is available.
+    #[must_use]
+    pub fn wake_descriptor(&self) -> Option<BorrowedFd<'_>> {
+        self.states.wake_descriptor()
     }
 
     /// Queues one action without blocking display or input work.
@@ -225,7 +224,7 @@ impl Drop for DesktopProvider {
     }
 }
 
-fn provider_worker(path: &Path, actions: &ActionMailbox, states: &mpsc::Sender<DesktopState>) {
+fn provider_worker(path: &Path, actions: &ActionMailbox, states: &Publisher<DesktopState>) {
     let mut available = None;
     loop {
         let state = if let Ok(state) = query_status(path) {
@@ -238,7 +237,7 @@ fn provider_worker(path: &Path, actions: &ActionMailbox, states: &mpsc::Sender<D
         // Publish every authoritative poll, including an unchanged value. The
         // renderer may be displaying an optimistic action result that a failed
         // or no-op provider did not actually apply.
-        if states.send(state).is_err() {
+        if states.publish(state).is_err() {
             return;
         }
 
@@ -615,7 +614,7 @@ mod tests {
 
     #[test]
     fn volume_drag_retains_only_the_latest_pending_position() {
-        let (_state_sender, state_receiver) = mpsc::channel();
+        let (_state_sender, state_receiver) = latest::channel().expect("state channel");
         let provider = DesktopProvider {
             actions: Arc::new(ActionMailbox::default()),
             states: state_receiver,
@@ -635,7 +634,7 @@ mod tests {
 
     #[test]
     fn volume_coalescing_preserves_discrete_action_order() {
-        let (_state_sender, state_receiver) = mpsc::channel();
+        let (_state_sender, state_receiver) = latest::channel().expect("state channel");
         let provider = DesktopProvider {
             actions: Arc::new(ActionMailbox::default()),
             states: state_receiver,

@@ -4,6 +4,7 @@ use std::ffi::CStr;
 use std::fmt;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::ffi;
 
@@ -292,6 +293,41 @@ impl SystemdSeqPacketListener {
     }
 }
 
+/// Most descriptors one [`wait_readable`] call can watch.
+pub const MAX_WAIT_DESCRIPTORS: usize = 4;
+
+/// Blocks until any present descriptor is readable, hung up, or failed, or
+/// until `timeout` passes. A `None` timeout waits indefinitely. Nothing is
+/// consumed, so callers recheck every source afterwards.
+///
+/// Returns `false` when the wait timed out or a signal interrupted it.
+///
+/// # Errors
+///
+/// Rejects more than [`MAX_WAIT_DESCRIPTORS`] entries or no present
+/// descriptor, and reports a static error when polling fails.
+pub fn wait_readable(
+    descriptors: &[Option<BorrowedFd<'_>>],
+    timeout: Option<Duration>,
+) -> Result<bool, SeqPacketError> {
+    let mut raw = [-1; MAX_WAIT_DESCRIPTORS];
+    if descriptors.len() > raw.len() {
+        return Err(SeqPacketError::InvalidArgument);
+    }
+    for (slot, descriptor) in raw.iter_mut().zip(descriptors) {
+        *slot = descriptor.map_or(-1, |descriptor| descriptor.as_raw_fd());
+    }
+    let (status, ready) = ffi::wait_readable(
+        &raw[..descriptors.len()],
+        crate::poll_timeout::milliseconds(timeout),
+    );
+    match check(status) {
+        Ok(()) => Ok(ready != 0),
+        Err(SeqPacketError::Interrupted) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Borrowed local seqpacket listener descriptor.
 #[derive(Clone, Copy, Debug)]
 pub struct SeqPacketListener<'fd> {
@@ -571,6 +607,33 @@ mod tests {
     use std::os::unix::net::{UnixDatagram, UnixStream};
 
     use super::*;
+
+    #[test]
+    fn wait_readable_times_out_then_wakes_for_a_signal_from_another_thread() {
+        let (connection, _connection_peer) = UnixStream::pair().expect("connection pair");
+        let (wake, mut waker) = UnixStream::pair().expect("wake pair");
+        let watched = [Some(connection.as_fd()), None, Some(wake.as_fd())];
+
+        assert_eq!(
+            wait_readable(&watched, Some(Duration::from_millis(1))),
+            Ok(false)
+        );
+        let signal = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            waker.write_all(b"w").expect("signal wake");
+            waker
+        });
+        assert_eq!(wait_readable(&watched, None), Ok(true));
+        let _waker = signal.join().expect("signal thread");
+        assert_eq!(
+            wait_readable(&[None; MAX_WAIT_DESCRIPTORS + 1], None),
+            Err(SeqPacketError::InvalidArgument)
+        );
+        assert_eq!(
+            wait_readable(&[None], None),
+            Err(SeqPacketError::InvalidArgument)
+        );
+    }
 
     #[test]
     fn activation_values_are_canonical_and_exactly_one_descriptor() {

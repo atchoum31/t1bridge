@@ -322,6 +322,13 @@ unsafe extern "C" {
     #[cfg(feature = "seqpacket")]
     fn t1_seqpacket_listener_ready(listener_descriptor: c_int, ready: *mut c_int) -> c_int;
     #[cfg(feature = "seqpacket")]
+    fn t1_seqpacket_wait_readable(
+        descriptors: *const c_int,
+        descriptor_count: usize,
+        timeout_ms: u32,
+        ready_mask: *mut u32,
+    ) -> c_int;
+    #[cfg(feature = "seqpacket")]
     fn t1_seqpacket_accept(listener_descriptor: c_int, client_descriptor: *mut c_int) -> c_int;
     #[cfg(feature = "seqpacket")]
     fn t1_seqpacket_connect_touchbar(client_descriptor: *mut c_int) -> c_int;
@@ -1360,6 +1367,23 @@ pub(super) fn listener_ready(listener: RawFd) -> (c_int, bool) {
     // borrowed listener open for the complete nonblocking probe.
     let status = unsafe { t1_seqpacket_listener_ready(listener, &raw mut ready) };
     (status, ready != 0)
+}
+
+#[cfg(feature = "seqpacket")]
+pub(super) fn wait_readable(descriptors: &[RawFd], timeout_ms: u32) -> (c_int, u32) {
+    let mut ready = 0;
+    // SAFETY: the slice is valid for `descriptors.len()` C `int`s, `ready` is
+    // writable for one `u32`, and the caller keeps every borrowed descriptor
+    // open for the call. The native boundary retains no descriptor.
+    let status = unsafe {
+        t1_seqpacket_wait_readable(
+            descriptors.as_ptr(),
+            descriptors.len(),
+            timeout_ms,
+            &raw mut ready,
+        )
+    };
+    (status, ready)
 }
 
 #[cfg(feature = "seqpacket")]

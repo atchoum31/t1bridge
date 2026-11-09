@@ -4,6 +4,7 @@ pub mod builtin_renderer;
 pub mod desktop_provider;
 pub mod framebuffer;
 pub mod gesture;
+mod latest;
 mod overlay_labels;
 pub mod overlay_state;
 pub mod renderer_launcher;

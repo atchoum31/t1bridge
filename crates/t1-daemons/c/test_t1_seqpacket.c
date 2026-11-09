@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -15,6 +16,7 @@
 #include <sys/time.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static unsigned int failures;
@@ -984,6 +986,78 @@ static void test_peer_group_admission_bounds_and_validates_kernel_results(void)
 	close_descriptor(descriptors[1]);
 }
 
+static void test_wait_readable_blocks_until_any_descriptor_is_ready(void)
+{
+	static const uint8_t byte = 0x57;
+	int connection[2] = { -1, -1 };
+	int wake[2] = { -1, -1 };
+	int watched[3];
+	uint32_t ready = UINT32_MAX;
+	uint8_t received = 0;
+	pid_t writer;
+	int status = 0;
+
+	create_pair(connection);
+	create_pair(wake);
+	watched[0] = connection[0];
+	watched[1] = -1;
+	watched[2] = wake[0];
+	EXPECT_STATUS(T1_SEQPACKET_OK,
+		      t1_seqpacket_wait_readable(watched, 3, 0, &ready));
+	EXPECT_TRUE(ready == 0);
+
+	writer = fork();
+	EXPECT_TRUE(writer >= 0);
+	if (writer == 0) {
+		struct timespec delay = { .tv_nsec = 20000000 };
+
+		nanosleep(&delay, NULL);
+		_exit(send(wake[1], &byte, sizeof(byte), MSG_NOSIGNAL) == 1 ?
+			      EXIT_SUCCESS : EXIT_FAILURE);
+	}
+	EXPECT_STATUS(T1_SEQPACKET_OK,
+		      t1_seqpacket_wait_readable(watched, 3,
+						 T1_SEQPACKET_WAIT_FOREVER,
+						 &ready));
+	EXPECT_TRUE(ready == UINT32_C(4));
+	EXPECT_TRUE(waitpid(writer, &status, 0) == writer);
+	EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS);
+	EXPECT_TRUE(recv(wake[0], &received, sizeof(received), 0) == 1);
+	EXPECT_STATUS(T1_SEQPACKET_OK,
+		      t1_seqpacket_wait_readable(watched, 3, 1, &ready));
+	EXPECT_TRUE(ready == 0);
+
+	close_descriptor(connection[1]);
+	connection[1] = -1;
+	EXPECT_STATUS(T1_SEQPACKET_OK,
+		      t1_seqpacket_wait_readable(watched, 3,
+						 T1_SEQPACKET_WAIT_FOREVER,
+						 &ready));
+	EXPECT_TRUE(ready == UINT32_C(1));
+
+	watched[0] = -1;
+	watched[2] = -1;
+	EXPECT_STATUS(T1_SEQPACKET_INVALID_ARGUMENT,
+		      t1_seqpacket_wait_readable(watched, 3, 0, &ready));
+	watched[0] = -2;
+	EXPECT_STATUS(T1_SEQPACKET_INVALID_ARGUMENT,
+		      t1_seqpacket_wait_readable(watched, 1, 0, &ready));
+	watched[0] = connection[0];
+	EXPECT_STATUS(T1_SEQPACKET_INVALID_ARGUMENT,
+		      t1_seqpacket_wait_readable(
+			      watched, T1_SEQPACKET_WAIT_MAX_DESCRIPTORS + 1, 0,
+			      &ready));
+	EXPECT_STATUS(T1_SEQPACKET_INVALID_ARGUMENT,
+		      t1_seqpacket_wait_readable(watched, 1,
+						 (unsigned int)INT_MAX + 1U,
+						 &ready));
+	EXPECT_STATUS(T1_SEQPACKET_INVALID_ARGUMENT,
+		      t1_seqpacket_wait_readable(watched, 1, 0, NULL));
+	close_descriptor(connection[0]);
+	close_descriptor(wake[0]);
+	close_descriptor(wake[1]);
+}
+
 static void test_disconnect_probe_is_non_consuming_and_fail_closed(void)
 {
 	static const uint8_t packet[] = { 0x54, 0x31, 0x41, 0x55 };
@@ -1594,6 +1668,7 @@ int main(void)
 	test_kernel_peer_credentials();
 	test_peer_group_admission_uses_kernel_primary_and_supplementary();
 	test_peer_group_admission_bounds_and_validates_kernel_results();
+	test_wait_readable_blocks_until_any_descriptor_is_ready();
 	test_disconnect_probe_is_non_consuming_and_fail_closed();
 	test_packet_boundaries_and_truncation();
 	test_ancillary_rights_are_rejected_without_fd_leak();
