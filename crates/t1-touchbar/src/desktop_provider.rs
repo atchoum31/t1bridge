@@ -25,6 +25,7 @@ const STATUS_VERSION: &str = "1";
 const STATUS_OUTPUT_LIMIT: usize = 128;
 const CALL_DEADLINE: Duration = Duration::from_millis(500);
 const STATUS_INTERVAL: Duration = Duration::from_secs(1);
+const IDLE_STATUS_INTERVAL: Duration = Duration::from_secs(8);
 const WAIT_INTERVAL: Duration = Duration::from_millis(5);
 const ACTION_QUEUE_CAPACITY: usize = 16;
 
@@ -147,6 +148,7 @@ pub struct DesktopProvider {
 #[derive(Debug, Default)]
 struct ActionQueue {
     pending: VecDeque<DesktopAction>,
+    refresh: bool,
     closed: bool,
 }
 
@@ -215,6 +217,17 @@ impl DesktopProvider {
         self.actions.ready.notify_one();
         true
     }
+
+    /// Asks for a status refresh as soon as the one-per-second limit allows,
+    /// so a touch sees current state after an idle backoff.
+    pub fn request_refresh(&self) {
+        if let Ok(mut queue) = self.actions.queue.lock()
+            && !queue.refresh
+        {
+            queue.refresh = true;
+            self.actions.ready.notify_one();
+        }
+    }
 }
 
 impl Drop for DesktopProvider {
@@ -228,7 +241,10 @@ impl Drop for DesktopProvider {
 
 fn provider_worker(path: &Path, actions: &ActionMailbox, states: &Publisher<DesktopState>) {
     let mut available = None;
+    let mut previous = None;
+    let mut interval = STATUS_INTERVAL;
     loop {
+        let queried_at = Instant::now();
         let state = if let Ok(state) = query_status(path) {
             report_availability(&mut available, true);
             state
@@ -236,6 +252,8 @@ fn provider_worker(path: &Path, actions: &ActionMailbox, states: &Publisher<Desk
             report_availability(&mut available, false);
             DesktopState::default()
         };
+        interval = next_status_interval(interval, previous, state);
+        previous = Some(state);
         // Publish every authoritative poll, including an unchanged value. The
         // renderer may be displaying an optimistic action result that a failed
         // or no-op provider did not actually apply.
@@ -243,39 +261,70 @@ fn provider_worker(path: &Path, actions: &ActionMailbox, states: &Publisher<Desk
             return;
         }
 
-        let refresh_at = Instant::now() + STATUS_INTERVAL;
+        let mut refresh_at = queried_at + interval;
         loop {
-            let Some(action) = take_action(actions, refresh_at) else {
-                if actions.queue.lock().is_ok_and(|queue| queue.closed) {
-                    return;
+            match take_request(actions, refresh_at) {
+                ProviderRequest::Closed => return,
+                ProviderRequest::Refresh => {}
+                ProviderRequest::Action(action) => {
+                    if run_action(path, ProviderOperation::Desktop(action)).is_err() {
+                        report_availability(&mut available, false);
+                    }
                 }
-                break;
-            };
-            if run_action(path, ProviderOperation::Desktop(action)).is_err() {
-                report_availability(&mut available, false);
+                ProviderRequest::Deadline => break,
             }
+            interval = STATUS_INTERVAL;
+            refresh_at = refresh_at.min(queried_at + STATUS_INTERVAL);
         }
     }
 }
 
-fn take_action(actions: &ActionMailbox, deadline: Instant) -> Option<DesktopAction> {
-    let mut queue = actions.queue.lock().ok()?;
+/// Backs off while status stays the same, and starts at the longest interval
+/// while the panel is dark, since only the desktop can change it then.
+fn next_status_interval(
+    current: Duration,
+    previous: Option<DesktopState>,
+    state: DesktopState,
+) -> Duration {
+    if state.display_off {
+        IDLE_STATUS_INTERVAL
+    } else if previous == Some(state) {
+        current.saturating_mul(2).min(IDLE_STATUS_INTERVAL)
+    } else {
+        STATUS_INTERVAL
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ProviderRequest {
+    Action(DesktopAction),
+    Refresh,
+    Deadline,
+    Closed,
+}
+
+fn take_request(actions: &ActionMailbox, deadline: Instant) -> ProviderRequest {
+    let Ok(mut queue) = actions.queue.lock() else {
+        return ProviderRequest::Closed;
+    };
     loop {
         if queue.closed {
-            return None;
+            return ProviderRequest::Closed;
         }
         if let Some(action) = queue.pending.pop_front() {
-            return Some(action);
+            return ProviderRequest::Action(action);
+        }
+        if std::mem::take(&mut queue.refresh) {
+            return ProviderRequest::Refresh;
         }
         let wait = deadline.saturating_duration_since(Instant::now());
         if wait.is_zero() {
-            return None;
+            return ProviderRequest::Deadline;
         }
-        let (next, timed) = actions.ready.wait_timeout(queue, wait).ok()?;
+        let Ok((next, _)) = actions.ready.wait_timeout(queue, wait) else {
+            return ProviderRequest::Closed;
+        };
         queue = next;
-        if timed.timed_out() {
-            return None;
-        }
     }
 }
 
@@ -647,11 +696,11 @@ mod tests {
         assert!(provider.dispatch(DesktopAction::SetVolume(40)));
         assert!(provider.dispatch(DesktopAction::SetVolume(80)));
         assert_eq!(
-            take_action(
+            take_request(
                 &provider.actions,
                 Instant::now() + Duration::from_millis(10)
             ),
-            Some(DesktopAction::SetVolume(80))
+            ProviderRequest::Action(DesktopAction::SetVolume(80))
         );
     }
 
@@ -673,13 +722,75 @@ mod tests {
             DesktopAction::SetVolume(80),
         ] {
             assert_eq!(
-                take_action(
+                take_request(
                     &provider.actions,
                     Instant::now() + Duration::from_millis(10)
                 ),
-                Some(expected)
+                ProviderRequest::Action(expected)
             );
         }
+    }
+
+    #[test]
+    fn unchanged_status_backs_off_until_a_change_or_a_dark_panel() {
+        let lit = DesktopState {
+            capabilities: DesktopCapabilities::AUDIO,
+            volume: Some(40),
+            muted: false,
+            display_off: false,
+        };
+        let louder = DesktopState {
+            volume: Some(60),
+            ..lit
+        };
+        let mut interval = next_status_interval(STATUS_INTERVAL, None, lit);
+        assert_eq!(interval, STATUS_INTERVAL);
+        let mut backoff = Vec::new();
+        for _ in 0..5 {
+            interval = next_status_interval(interval, Some(lit), lit);
+            backoff.push(interval.as_secs());
+        }
+        assert_eq!(backoff, [2, 4, 8, 8, 8]);
+        assert_eq!(
+            next_status_interval(interval, Some(lit), louder),
+            STATUS_INTERVAL
+        );
+
+        let dark = DesktopState {
+            capabilities: lit.capabilities | DesktopCapabilities::DISPLAY_POWER,
+            display_off: true,
+            ..lit
+        };
+        assert_eq!(
+            next_status_interval(STATUS_INTERVAL, Some(lit), dark),
+            IDLE_STATUS_INTERVAL
+        );
+    }
+
+    #[test]
+    fn refresh_requests_coalesce_and_yield_to_pending_actions() {
+        let (_state_sender, state_receiver) = latest::channel().expect("state channel");
+        let provider = DesktopProvider {
+            actions: Arc::new(ActionMailbox::default()),
+            states: state_receiver,
+        };
+        let soon = || Instant::now() + Duration::from_millis(10);
+
+        provider.request_refresh();
+        provider.request_refresh();
+        assert!(provider.dispatch(DesktopAction::ToggleMute));
+        assert_eq!(
+            take_request(&provider.actions, soon()),
+            ProviderRequest::Action(DesktopAction::ToggleMute)
+        );
+        assert_eq!(
+            take_request(&provider.actions, soon()),
+            ProviderRequest::Refresh
+        );
+        assert_eq!(
+            take_request(&provider.actions, soon()),
+            ProviderRequest::Deadline
+        );
     }
 
     #[test]

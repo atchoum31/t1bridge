@@ -412,6 +412,10 @@ the controls.
 
 Provider stdout is limited to 128 bytes and each process receives a 500 ms
 monotonic deadline. A status record is refreshed at most once per second.
+The built-in renderer refreshes every second while status changes, doubles
+the interval up to eight seconds while it stays the same, and uses eight
+seconds at once while `DISPLAY` is `0`. An action, a new touch, or any touch
+on a dark panel returns it to one second.
 Actions return exit status zero for accepted delivery; their output is ignored.
 Malformed, oversized, timed-out, signaled, nonzero, missing, or disappearing
 providers become unavailable without stopping or restarting the renderer.

@@ -323,6 +323,12 @@ fn desktop_stock_capabilities(state: DesktopState) -> StockCapabilities {
     capabilities
 }
 
+fn request_desktop_refresh(provider: Option<&DesktopProvider>) {
+    if let Some(provider) = provider {
+        provider.request_refresh();
+    }
+}
+
 fn dispatch_desktop(provider: Option<&DesktopProvider>, action: DesktopAction) {
     if let Some(provider) = provider {
         let _ = provider.dispatch(action);
@@ -485,7 +491,11 @@ impl RendererSession {
                 if envelope.request_id != 0 {
                     return Err(BuiltinRendererError::Protocol);
                 }
+                let was_idle = self.input.is_idle();
                 let outcome = self.observe_input(frame)?;
+                if (was_idle && !self.input.is_idle()) || self.display_off {
+                    request_desktop_refresh(provider);
+                }
                 self.dirty |= outcome.redraw;
                 for action in outcome.actions {
                     self.dispatch(action, connection, provider)?;
